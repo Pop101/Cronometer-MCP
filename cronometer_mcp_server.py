@@ -91,7 +91,12 @@ class CronoClient:
                 self._headers = {"x-crono-session": self._token, "content-type": "application/json"}
                 log.info(f"Logged in: userId={self._user_id}")
                 today = _date_cls.today().isoformat()
-                self._cache_login_diary(data, today)
+                # Also fetch diary for today via get_diary
+                try:
+                    diary_data = self._v2("get_diary", day=today)
+                    self._cache_api_diary(diary_data, today)
+                except Exception:
+                    pass
                 return
             except (httpx.HTTPStatusError, httpx.TimeoutException, ConnectionError) as e:
                 if attempt < 2:
@@ -121,6 +126,32 @@ class CronoClient:
                 if key not in seen:
                     entries.append(le)
             self._local_diary[day] = entries
+
+    def _cache_api_diary(self, data, day):
+        """Cache diary entries from get_diary API response."""
+        if "diary" not in data:
+            return
+        entries = []
+        for e in data["diary"]:
+            if e.get("type") == "Serving":
+                entries.append({
+                    "serving_id": e.get("servingId"),
+                    "food_id": e.get("foodId"),
+                    "measure_id": e.get("measureId"),
+                    "grams": e.get("grams", 0),
+                    "source": "api",
+                })
+        if entries:
+            # Merge with existing local entries
+            existing = self._local_diary.get(day, [])
+            seen = {(e.get("food_id"), round(e.get("grams", 0), 1)) for e in entries}
+            for le in existing:
+                key = (le.get("food_id"), round(le.get("grams", 0), 1))
+                if key not in seen:
+                    entries.append(le)
+                    seen.add(key)
+            self._local_diary[day] = entries
+            log.info(f"Cached {len(entries)} API entries for {day}")
 
     def _v2(self, endpoint, **extra):
         payload = {"auth": self._auth_block(), **extra}
@@ -153,26 +184,70 @@ class CronoClient:
         return self._v2("get_food", id=food_id)
 
     def get_diary(self, day: str):
-        entries = self._local_diary.get(day, [])
+        """Get diary entries. Uses get_diary API (with 'day' param) + local cache."""
+        # Try API first
+        api_entries = []
         energy_summary = {}
         try:
-            nuts = self._v2("get_nutrients", date=day)
-            for n in nuts.get("nutrients", []):
-                name = n.get("name", "")
-                if name == "Energy":
-                    energy_summary["target_kcal"] = n.get("rdi_AMERICAN", n.get("rdi", 2000))
-                elif name == "Protein":
-                    energy_summary["target_protein_g"] = n.get("rdi_AMERICAN", n.get("rdi", 50))
-                elif name == "Fat":
-                    energy_summary["target_fat_g"] = n.get("rdi_AMERICAN", n.get("rdi", 65))
-                elif name == "Carbs":
-                    energy_summary["target_carbs_g"] = n.get("rdi_AMERICAN", n.get("rdi", 300))
+            data = self._v2("get_diary", day=day)
+            if "diary" in data:
+                for e in data["diary"]:
+                    if e.get("type") == "Serving":
+                        api_entries.append({
+                            "serving_id": e.get("servingId"),
+                            "food_id": e.get("foodId"),
+                            "measure_id": e.get("measureId"),
+                            "grams": e.get("grams", 0),
+                            "source": "api",
+                        })
+            if "summary" in data:
+                consumed = data["summary"].get("consumed", {})
+                macros = data["summary"].get("macros", {})
+                energy_summary = {
+                    "consumed_kcal": consumed.get("total", 0),
+                    "protein_g": consumed.get("protein_g", 0),
+                    "carbs_g": consumed.get("carbs_g", 0),
+                    "fat_g": consumed.get("fat_g", 0),
+                    "target_kcal": macros.get("energy", 0),
+                    "target_protein_g": macros.get("protein", 0),
+                    "target_carbs_g": macros.get("carbs", 0),
+                    "target_fat_g": macros.get("fat", 0),
+                }
         except Exception as e:
-            log.warning(f"get_nutrients failed for {day}: {e}")
-        return {"date": day, "entries": entries, "energy_summary": energy_summary, "entry_count": len(entries)}
+            log.warning(f"get_diary API failed for {day}: {e}")
+
+        # Merge with local entries
+        local = self._local_diary.get(day, [])
+        seen = {(e.get("food_id"), round(e.get("grams", 0), 1)) for e in api_entries}
+        merged = list(api_entries)
+        for le in local:
+            key = (le.get("food_id"), round(le.get("grams", 0), 1))
+            if key not in seen:
+                merged.append(le)
+                seen.add(key)
+
+        # Detect duplicates
+        dup_check = {}
+        for e in merged:
+            key = (e.get("food_id"), round(e.get("grams", 0), 1))
+            dup_check.setdefault(key, []).append(e)
+        duplicates = {k: v for k, v in dup_check.items() if len(v) > 1}
+
+        return {
+            "date": day,
+            "entries": merged,
+            "energy_summary": energy_summary,
+            "entry_count": len(merged),
+            "duplicate_groups": len(duplicates),
+            "duplicates": [
+                {"food_id": k[0], "grams": k[1], "count": len(v), 
+                 "serving_ids": [e.get("serving_id") for e in v if e.get("serving_id")]}
+                for k, v in duplicates.items()
+            ] if duplicates else [],
+        }
 
     def get_nutrients(self, day: str):
-        return self._v2("get_nutrients", date=day)
+        return self._v2("get_nutrients", day=day)
 
     def add_serving(self, food_id: int, measure_id: int, grams: float,
                     day: str, diary_group: int = 0):
@@ -219,7 +294,7 @@ class CronoClient:
         return result
 
     def mark_day_complete(self, day: str, complete: bool = True):
-        return self._v2("set_complete", date=day, complete=complete)
+        return self._v2("set_complete", day=day, complete=complete)
 
     def copy_day(self, from_day: str, to_day: str):
         return self._v2("copy", fromDate=from_day, toDate=to_day)
@@ -237,7 +312,7 @@ class CronoClient:
         return self._v2("get_fasting_stats")
 
     def get_nutrition_scores(self, day: str):
-        return self._v2("get_nutrition_scores", date=day)
+        return self._v2("get_nutrition_scores", day=day)
 
 
 # ── lazy init ───────────────────────────────────────────────────────
