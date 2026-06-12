@@ -287,11 +287,32 @@ class CronoClient:
         self._recent_adds[dedup_key] = now
         return result
 
-    def remove_serving(self, serving_id: int):
-        result = self._v2("delete_serving", servingId=serving_id)
-        for day, entries in self._local_diary.items():
-            self._local_diary[day] = [e for e in entries if e.get("id") != serving_id]
-        return result
+    def remove_entries(self, serving_ids: list, day: str = None):
+        """Delete diary entries using v3 DELETE /api/v3/user/{id}/diary-entries.
+        Requires full entry objects, not just IDs."""
+        day = day or _date_cls.today().isoformat()
+        # Get diary to find full entry objects
+        diary_data = self._v2("get_diary", day=day)
+        diary_entries = diary_data.get("diary", [])
+        id_set = set(str(sid) for sid in serving_ids)
+        to_delete = [e for e in diary_entries if str(e.get("servingId")) in id_set]
+        if not to_delete:
+            return {"removed": [], "count": 0, "note": "No matching entries found"}
+        # v3 DELETE with full objects
+        r = http.request(
+            "DELETE",
+            f"{BASE_URL}/api/v3/user/{self._user_id}/diary-entries",
+            json={"diaryEntries": to_delete},
+            headers=self._headers,
+        )
+        if r.status_code == 204:
+            removed = [str(e.get("servingId")) for e in to_delete]
+            # Remove from local cache
+            for d, entries in self._local_diary.items():
+                self._local_diary[d] = [e for e in entries if str(e.get("serving_id")) not in id_set]
+            return {"removed": removed, "count": len(removed)}
+        else:
+            raise Exception(f"Delete failed: HTTP {r.status_code} - {r.text[:200]}")
 
     def mark_day_complete(self, day: str, complete: bool = True):
         return self._v2("set_complete", day=day, complete=complete)
@@ -427,11 +448,14 @@ def add_food_entry(food_id: int, measure_id: int, grams: float,
         return _err(e)
 
 @mcp.tool()
-def remove_food_entry(serving_id: int) -> str:
-    """Remove a food entry from your Cronometer diary by its serving ID.
+def remove_food_entry(serving_ids: str, date: Optional[str] = None) -> str:
+    """Remove food entries from your Cronometer diary by serving ID(s).
+    Pass comma-separated serving IDs (e.g. "12345,67890").
     Use get_food_log to find serving IDs first."""
     try:
-        return _ok(_get_client().remove_serving(serving_id))
+        ids = [int(x.strip()) for x in serving_ids.split(",") if x.strip()]
+        d = _parse_date(date)
+        return _ok(_get_client().remove_entries(ids, d))
     except Exception as e:
         return _err(e)
 
